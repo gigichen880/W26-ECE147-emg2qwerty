@@ -139,7 +139,8 @@ class TransformerSequenceEncoder(nn.Module):
         if lengths is not None:
             if lengths.shape != (N,):
                 raise ValueError(f"lengths must have shape (N,), got {tuple(lengths.shape)}")
-            src_key_padding_mask = lengths_to_padding_mask(lengths.to(x.device), max_len=T)  # (N, T)
+            lengths = lengths.to(device=x.device, dtype=torch.long)
+            src_key_padding_mask = lengths_to_padding_mask(lengths, max_len=T)  # (N, T)
 
         y = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # (T, N, D)
         return self.out_norm(y)

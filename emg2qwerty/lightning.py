@@ -361,6 +361,10 @@ class TransformerCTCModule(pl.LightningModule):
         targets = batch["targets"]
         input_lengths = batch["input_lengths"]
         target_lengths = batch["target_lengths"]
+
+        input_lengths = input_lengths.to(device=inputs.device, dtype=torch.long)
+        target_lengths = target_lengths.to(device=inputs.device, dtype=torch.long)
+       
         N = len(input_lengths)
 
         emissions = self.forward(inputs, input_lengths=input_lengths)
