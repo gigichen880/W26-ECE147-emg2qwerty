@@ -9,6 +9,140 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
+import math
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Standard sinusoidal positional encoding.
+    Adds position-dependent signal to a (T, N, D) sequence tensor.
+
+    Args:
+        d_model: feature dimension D
+        max_len: maximum supported sequence length T
+        dropout: dropout applied after adding positional encoding
+    """
+
+    def __init__(self, d_model: int, max_len: int = 4096, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        pe = torch.zeros(max_len, d_model)  # (T, D)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # (T, 1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+        )  # (D/2,)
+
+        pe[:, 0::2] = torch.sin(position * div_term)  # even dims
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd dims
+
+        # register as buffer so it moves with .to(device) but isn't a parameter
+        self.register_buffer("pe", pe, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (T, N, D)
+        Returns:
+            (T, N, D)
+        """
+        T = x.shape[0]
+        if T > self.pe.shape[0]:
+            raise ValueError(f"Sequence length T={T} exceeds max_len={self.pe.shape[0]}")
+        x = x + self.pe[:T].unsqueeze(1)  # (T, 1, D) broadcast over N
+        return self.dropout(x)
+
+
+def lengths_to_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    """
+    Build a src_key_padding_mask for nn.TransformerEncoder.
+
+    Args:
+        lengths: (N,) int tensor of valid lengths (<= max_len)
+        max_len: T
+    Returns:
+        mask: (N, T) bool tensor where True indicates PAD (to be ignored)
+    """
+    # shape: (N, T)
+    arange = torch.arange(max_len, device=lengths.device).unsqueeze(0)
+    return arange >= lengths.unsqueeze(1)
+
+
+class TransformerSequenceEncoder(nn.Module):
+    """
+    Transformer encoder over time for (T, N, D) sequences.
+
+    - No temporal downsampling: output time length equals input time length.
+    - Uses src_key_padding_mask so padded timesteps do not participate in attention.
+
+    Args:
+        d_model: input/output feature dim D
+        nhead: number of attention heads (must divide d_model)
+        num_layers: number of encoder layers
+        dim_feedforward: FFN hidden size (default: 4*d_model)
+        dropout: dropout in transformer layers
+        max_len: max sequence length for sinusoidal positions
+        norm_first: Pre-LN if True (recommended for stability)
+        use_positional_encoding: if True, adds sinusoidal position encoding
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int | None = None,
+        dropout: float = 0.1,
+        max_len: int = 4096,
+        norm_first: bool = True,
+        use_positional_encoding: bool = True,
+    ) -> None:
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by nhead={nhead}")
+
+        self.use_positional_encoding = use_positional_encoding
+        self.pos_enc = (
+            SinusoidalPositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+            if use_positional_encoding
+            else nn.Identity()
+        )
+
+        d_ff = dim_feedforward if dim_feedforward is not None else 4 * d_model
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,   # expects (T, N, D)
+            norm_first=norm_first,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+        # Optional final norm (often helps)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            x: (T, N, D)
+            lengths: (N,) valid lengths before padding. If None, no padding mask is used.
+        Returns:
+            y: (T, N, D)
+        """
+        T, N, D = x.shape
+
+        x = self.pos_enc(x)
+
+        src_key_padding_mask = None
+        if lengths is not None:
+            if lengths.shape != (N,):
+                raise ValueError(f"lengths must have shape (N,), got {tuple(lengths.shape)}")
+            src_key_padding_mask = lengths_to_padding_mask(lengths.to(x.device), max_len=T)  # (N, T)
+
+        y = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # (T, N, D)
+        return self.out_norm(y)
 
 class SpectrogramNorm(nn.Module):
     """A `torch.nn.Module` that applies 2D batch normalization over spectrogram
