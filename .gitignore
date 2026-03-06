@@ -53,3 +53,8 @@ bids_data
 
 # LM
 wikitext-103-raw*
+
+# UV
+.python-version
+pyproject.toml
+uv.lock
