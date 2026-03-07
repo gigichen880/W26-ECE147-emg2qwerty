@@ -243,3 +243,83 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+@dataclass
+class ZScoreNormalize:
+    """
+    Z-score normalize a tensor over time dimension.
+
+    Assumes input shape is (T, ..., C) or (T, ..., C, freq).
+    Normalizes per "feature" (everything except time).
+    """
+    eps: float = 1e-6
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        # mean/std over time
+        mean = tensor.mean(dim=0, keepdim=True)
+        std = tensor.std(dim=0, keepdim=True, unbiased=False).clamp_min(self.eps)
+        return (tensor - mean) / std
+
+
+@dataclass
+class AdditiveGaussianNoise:
+    """
+    Adds Gaussian noise with probability p.
+
+    If `relative=True`, sigma is multiplied by per-feature std over time, so it
+    scales nicely across channels/bands.
+    """
+    sigma: float = 0.02
+    p: float = 0.5
+    relative: bool = True
+    eps: float = 1e-6
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.p <= 0:
+            return tensor
+        if np.random.rand() > self.p:
+            return tensor
+
+        if self.relative:
+            # std over time, per feature
+            scale = tensor.std(dim=0, keepdim=True, unbiased=False).clamp_min(self.eps)
+            noise = torch.randn_like(tensor) * (self.sigma * scale)
+        else:
+            noise = torch.randn_like(tensor) * self.sigma
+        return tensor + noise
+
+
+@dataclass
+class TimeMaskRaw:
+    """
+    Zero out random contiguous time spans on the raw (time-domain) tensor.
+
+    Assumes tensor shape begins with time dim: (T, ...).
+    """
+    max_width: int = 200   # in raw timesteps (at 2kHz, 200 = 100ms)
+    n_masks: int = 2
+    p: float = 0.5
+    mask_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        assert self.max_width >= 0
+        assert self.n_masks >= 0
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.p <= 0 or self.n_masks == 0 or self.max_width == 0:
+            return tensor
+        if np.random.rand() > self.p:
+            return tensor
+
+        T = tensor.shape[0]
+        if T <= 1:
+            return tensor
+
+        out = tensor.clone()
+        for _ in range(self.n_masks):
+            w = np.random.randint(1, self.max_width + 1)
+            if w >= T:
+                continue
+            t0 = np.random.randint(0, T - w)
+            out[t0:t0 + w, ...] = self.mask_value
+        return out
