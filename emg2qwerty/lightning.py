@@ -153,6 +153,7 @@ class CnnRnnCTCModule(pl.LightningModule):
         decoder: DictConfig,
         hidden_size: int = 128,
         num_layers: int = 2,
+        latent_dim: int = 256
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -176,6 +177,7 @@ class CnnRnnCTCModule(pl.LightningModule):
                 num_features=num_features,
                 hidden_size=hidden_size,
                 num_layers=num_layers,
+                latent_dim=latent_dim
             ),
             # (T, N, hidden_size * 2)
             nn.Linear(hidden_size * 2, charset().num_classes),

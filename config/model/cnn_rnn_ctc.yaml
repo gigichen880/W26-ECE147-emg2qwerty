@@ -5,8 +5,9 @@ module:
   mlp_features: [384]
   block_channels: [24, 24, 24, 24]
   kernel_width: 32  # Total temporal receptive field of 125 samples given 4 layers
-  hidden_size: 128
+  hidden_size: 256
   num_layers: 2
+  latent_dim: 512
 
 datamodule:
   _target_: emg2qwerty.lightning.WindowedEMGDataModule
