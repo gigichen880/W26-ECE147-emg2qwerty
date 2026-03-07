@@ -4,12 +4,11 @@ module:
   in_features: 528
   mlp_features: [384]
 
-  nhead: 8
-  num_layers: 6
-  dim_feedforward: 1024
+  nhead: 4
+  num_layers: 3
+  dim_feedforward: 768
   dropout: 0.1
-
-  max_len: 4096
+  
   norm_first: True
   use_positional_encoding: True
 

@@ -11,6 +11,7 @@ from torch import nn
 
 import math
 
+
 class SinusoidalPositionalEncoding(nn.Module):
     """
     Standard sinusoidal positional encoding.
@@ -18,39 +19,32 @@ class SinusoidalPositionalEncoding(nn.Module):
 
     Args:
         d_model: feature dimension D
-        max_len: maximum supported sequence length T
         dropout: dropout applied after adding positional encoding
     """
-
-    def __init__(self, d_model: int, max_len: int = 4096, dropout: float = 0.1) -> None:
+    def __init__(self, d_model: int, dropout: float = 0.1):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-
-        pe = torch.zeros(max_len, d_model)  # (T, D)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # (T, 1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
-        )  # (D/2,)
-
-        pe[:, 0::2] = torch.sin(position * div_term)  # even dims
-        pe[:, 1::2] = torch.cos(position * div_term)  # odd dims
-
-        # register as buffer so it moves with .to(device) but isn't a parameter
-        self.register_buffer("pe", pe, persistent=False)
+        self.d_model = d_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x: (T, N, D)
-        Returns:
-            (T, N, D)
+        x: (T, N, D)
         """
-        T = x.shape[0]
-        if T > self.pe.shape[0]:
-            raise ValueError(f"Sequence length T={T} exceeds max_len={self.pe.shape[0]}")
-        x = x + self.pe[:T].unsqueeze(1)  # (T, 1, D) broadcast over N
-        return self.dropout(x)
+        T, N, D = x.shape
+        device = x.device
 
+        position = torch.arange(T, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, D, 2, device=device) * (-math.log(10000.0) / D)
+        )
+
+        pe = torch.zeros(T, D, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        x = x + pe.unsqueeze(1)
+
+        return self.dropout(x)
 
 def lengths_to_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
     """
@@ -92,7 +86,6 @@ class TransformerSequenceEncoder(nn.Module):
         num_layers: int,
         dim_feedforward: int | None = None,
         dropout: float = 0.1,
-        max_len: int = 4096,
         norm_first: bool = True,
         use_positional_encoding: bool = True,
     ) -> None:
@@ -102,7 +95,7 @@ class TransformerSequenceEncoder(nn.Module):
 
         self.use_positional_encoding = use_positional_encoding
         self.pos_enc = (
-            SinusoidalPositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+            SinusoidalPositionalEncoding(d_model=d_model, dropout=dropout)
             if use_positional_encoding
             else nn.Identity()
         )

@@ -289,7 +289,6 @@ class TransformerCTCModule(pl.LightningModule):
         lr_scheduler: DictConfig,
         decoder: DictConfig,
         # optional positional encoding controls
-        max_len: int = 4096,
         norm_first: bool = True,
         use_positional_encoding: bool = True,
     ) -> None:
@@ -316,9 +315,14 @@ class TransformerCTCModule(pl.LightningModule):
             num_layers=num_layers,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            max_len=max_len,
             norm_first=norm_first,
             use_positional_encoding=use_positional_encoding,
+        )
+
+        # Linear projection before transformer
+        self.proj = nn.Sequential(
+            nn.Linear(num_features, num_features),
+            nn.LayerNorm(num_features)
         )
 
         # CTC head
@@ -353,6 +357,7 @@ class TransformerCTCModule(pl.LightningModule):
         x = self.spec_norm(inputs)
         x = self.mlp(x)
         x = self.flatten(x)                # (T, N, D)
+        x = self.proj(x)
         x = self.encoder(x, lengths=input_lengths)  # (T, N, D)
         return self.classifier(x)          # (T, N, num_classes)
 
