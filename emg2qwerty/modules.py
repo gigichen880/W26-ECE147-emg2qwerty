@@ -11,6 +11,30 @@ from torch import nn
 
 import math
 
+class TemporalConvFrontend(nn.Module):
+    """
+    Temporal convolution block before transformer.
+    Captures local EMG dynamics before attention.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (T, N, D)
+        """
+        x = x.permute(1, 2, 0)  # (N, D, T)
+        x = self.conv(x)
+        x = x.permute(2, 0, 1)  # (T, N, D)
+        return x
 
 class SinusoidalPositionalEncoding(nn.Module):
     """
