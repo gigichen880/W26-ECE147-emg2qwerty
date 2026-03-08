@@ -137,7 +137,7 @@ class TransformerSequenceEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
 
-        # Optional final norm (often helps)
+        # Optional final norm
         self.out_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:

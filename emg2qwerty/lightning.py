@@ -93,8 +93,8 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     transform=self.test_transform,
                     # Feed the entire session at once without windowing/padding
                     # at test time for more realism
-                    window_length=None,
-                    padding=(0, 0),
+                    window_length=self.window_length,
+                    padding=self.padding,
                     jitter=False,
                 )
                 for hdf5_path in self.test_sessions
@@ -358,9 +358,11 @@ class TransformerCTCModule(pl.LightningModule):
         x = self.spec_norm(inputs)
         x = self.mlp(x)
         x = self.flatten(x)                # (T, N, D)
+
         x = self.proj(x)
-        x = self.encoder(x, lengths=input_lengths)  # (T, N, D)
-        return self.classifier(x)          # (T, N, num_classes)
+
+        x = self.encoder(x, lengths=input_lengths) 
+        return self.classifier(x)          
 
     def _step(self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs) -> torch.Tensor:
         inputs = batch["inputs"]
@@ -375,7 +377,6 @@ class TransformerCTCModule(pl.LightningModule):
 
         emissions = self.forward(inputs, input_lengths=input_lengths)
 
-        # Transformer keeps time length unchanged (no downsampling)
         emission_lengths = input_lengths
 
         loss = self.ctc_loss(
