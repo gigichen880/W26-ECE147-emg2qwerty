@@ -3,6 +3,199 @@
 
 This course project is built upon the emg2qwerty work from Meta. The first section of this README provides some guidance for working with the repo and contains a running list of FAQs. **Note that the rest of the README is from the original repo and we encourage you to take a look at their work.**
 
+## Experiment Instructions
+
+### Direction 3 - Number of EMG Channels vs CER
+
+This experiment investigates how decoding performance changes as the number of electrode channels decreases. We randomly keep **K channels per band (out of 16)** and zero out the rest so that the model architecture does not need to change.
+
+#### 1. Code Change
+
+**File to edit**
+
+```
+emg2qwerty/transforms.py
+```
+
+Add the following transform:
+
+```python
+class RandomChannelSubset(Transform[torch.Tensor, torch.Tensor]):
+    """
+    Randomly keep K EMG channels per band and zero out the rest.
+    Keeps tensor shape unchanged.
+
+    Input shape: (T, bands=2, channels=16)
+    """
+
+    def __init__(self, k: int):
+        self.k = k
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        T, B, C = x.shape
+        keep = torch.randperm(C)[: self.k]
+
+        mask = torch.zeros_like(x)
+        mask[:, :, keep] = x[:, :, keep]
+        return mask
+```
+
+#### 2. YAML Config Change
+
+**File to edit**
+
+```
+configs/transforms/transforms.log_spectrogram(_aug).yaml
+```
+Add the transform definition:
+
+```yaml
+random_channel_subset:
+  _target_: emg2qwerty.transforms.RandomChannelSubset
+  k: 8 <--- the hyperparameter we change
+```
+
+Add the transform **right after `to_tensor`**.
+
+```yaml
+transforms:
+  train:
+    - ${to_tensor}
+    - ${random_channel_subset} # NEW
+    - ${raw_noise}
+    - ${raw_timemask}
+    - ${band_rotation}
+    - ${temporal_jitter}
+    - ${logspec}
+    - ${specaug}
+    - ${logspec_norm}
+```
+```yaml
+val:
+  - ${to_tensor}
+  - ${random_channel_subset} # NEW
+  - ${logspec}
+  - ${logspec_norm}
+```
+
+#### 3. Experiment Settings
+
+Change the parameter:
+
+```
+random_channel_subset.k
+```
+
+| k (channels per band) | total electrodes |
+| --------------------- | ---------------- |
+| 1                     | 2                |
+| 2                     | 4                |
+| 4                     | 8                |
+| 8                     | 16               |
+| 16                    | 32 (baseline)    |
+
+Example:
+
+```yaml
+k: 4
+```
+
+This keeps **4 channels per band (8 electrodes total)**.
+
+### Direction 4 - Training Data Size vs CER
+
+This experiment investigates how the amount of training data affects decoding performance.
+
+#### File to Edit
+
+```text
+configs/user/single_user.yaml
+```
+
+Modify the list:
+
+```
+dataset.train
+```
+
+Only change **training sessions**.
+Do **not modify `val` or `test` sessions**.
+
+#### Reduced Training Data Settings
+
+Create subsets of the `dataset.train` list.
+
+| Data fraction | # sessions | Example           |
+| ------------- | ---------- | ----------------- |
+| 25%           | 4          | first 4 sessions  |
+| 50%           | 8          | first 8 sessions  |
+| 75%           | 12         | first 12 sessions |
+| 100%(baseline)| 16         | all sessions      |
+
+#### Example: 50% Training Data
+
+Edit the `train` list to include only the first 8 sessions:
+
+```
+dataset:
+  train:
+  - session1
+  - session2
+  - session3
+  - session4
+  - session5
+  - session6
+  - session7
+  - session8
+```
+
+Leave `val` and `test` unchanged.
+
+### Direction 5 - Sampling Rate Experiment
+To investigate how the **sEMG sampling rate affects decoding performance (CER)**, modify the **`hop_length` parameter** in the spectrogram transform.
+
+#### File to Edit
+
+`configs/transforms/log_spectrogram.yaml` (or any transform yaml we investigate upon, like `log_spectrogram_aug.yaml`)
+
+Locate the `logspec` section:
+```
+logspec:
+  _target_: emg2qwerty.transforms.LogSpectrogram
+  n_fft: 64
+  hop_length: 16
+```
+Change the **`hop_length` value** to control the effective sampling rate.
+
+#### Hop Length vs Effective Sampling Rate
+
+| hop_length | Effective Rate    |
+| ---------- | ----------------- |
+| 1          | 2000 Hz           |
+| 2          | 1000 Hz           |
+| 4          | 500 Hz            |
+| 8          | 250 Hz            |
+| 16         | 125 Hz (baseline) |
+| 32         | 62.5 Hz           |
+
+The relationship is:
+```
+effective_rate = 2000 / hop_length
+```
+because the original EMG is sampled at **2000 Hz**.
+
+#### Example
+
+To test **500 Hz**, change:
+
+```
+hop_length: 4
+```
+Then retrain the model and record the resulting **CER**.
+Repeat for the different hop lengths to produce a **sampling rate vs CER** plot.
+
+
+
 ## Guiding Tips + FAQs
 _Last updated 2/13/2025_
 - Read through the Project Guidelines to ensure that you have a clear understanding of what we expect
