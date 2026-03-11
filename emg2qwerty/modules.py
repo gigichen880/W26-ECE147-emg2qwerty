@@ -9,6 +9,158 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
+import math
+
+class TemporalConvFrontend(nn.Module):
+    """
+    Temporal convolution block before transformer.
+    Captures local EMG dynamics before attention.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (T, N, D)
+        """
+        x = x.permute(1, 2, 0)  # (N, D, T)
+        x = self.conv(x)
+        x = x.permute(2, 0, 1)  # (T, N, D)
+        return x
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Standard sinusoidal positional encoding.
+    Adds position-dependent signal to a (T, N, D) sequence tensor.
+
+    Args:
+        d_model: feature dimension D
+        dropout: dropout applied after adding positional encoding
+    """
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.d_model = d_model
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (T, N, D)
+        """
+        T, N, D = x.shape
+        device = x.device
+
+        position = torch.arange(T, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, D, 2, device=device) * (-math.log(10000.0) / D)
+        )
+
+        pe = torch.zeros(T, D, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        x = x + pe.unsqueeze(1)
+
+        return self.dropout(x)
+
+def lengths_to_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    """
+    Build a src_key_padding_mask for nn.TransformerEncoder.
+
+    Args:
+        lengths: (N,) int tensor of valid lengths (<= max_len)
+        max_len: T
+    Returns:
+        mask: (N, T) bool tensor where True indicates PAD (to be ignored)
+    """
+    # shape: (N, T)
+    arange = torch.arange(max_len, device=lengths.device).unsqueeze(0)
+    return arange >= lengths.unsqueeze(1)
+
+
+class TransformerSequenceEncoder(nn.Module):
+    """
+    Transformer encoder over time for (T, N, D) sequences.
+
+    - No temporal downsampling: output time length equals input time length.
+    - Uses src_key_padding_mask so padded timesteps do not participate in attention.
+
+    Args:
+        d_model: input/output feature dim D
+        nhead: number of attention heads (must divide d_model)
+        num_layers: number of encoder layers
+        dim_feedforward: FFN hidden size (default: 4*d_model)
+        dropout: dropout in transformer layers
+        max_len: max sequence length for sinusoidal positions
+        norm_first: Pre-LN if True (recommended for stability)
+        use_positional_encoding: if True, adds sinusoidal position encoding
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int | None = None,
+        dropout: float = 0.1,
+        norm_first: bool = True,
+        use_positional_encoding: bool = True,
+    ) -> None:
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by nhead={nhead}")
+
+        self.use_positional_encoding = use_positional_encoding
+        self.pos_enc = (
+            SinusoidalPositionalEncoding(d_model=d_model, dropout=dropout)
+            if use_positional_encoding
+            else nn.Identity()
+        )
+
+        d_ff = dim_feedforward if dim_feedforward is not None else 4 * d_model
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,   # expects (T, N, D)
+            norm_first=norm_first,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+        # Optional final norm
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            x: (T, N, D)
+            lengths: (N,) valid lengths before padding. If None, no padding mask is used.
+        Returns:
+            y: (T, N, D)
+        """
+        T, N, D = x.shape
+
+        x = self.pos_enc(x)
+
+        src_key_padding_mask = None
+        if lengths is not None:
+            if lengths.shape != (N,):
+                raise ValueError(f"lengths must have shape (N,), got {tuple(lengths.shape)}")
+            lengths = lengths.to(device=x.device, dtype=torch.long)
+            src_key_padding_mask = lengths_to_padding_mask(lengths, max_len=T)  # (N, T)
+
+        y = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # (T, N, D)
+        return self.out_norm(y)
 
 class SpectrogramNorm(nn.Module):
     """A `torch.nn.Module` that applies 2D batch normalization over spectrogram
@@ -344,3 +496,135 @@ class BiLSTMEncoder(nn.Module):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         outputs, _ = self.lstm(inputs)
         return outputs
+
+
+class ResBlock1d(nn.Module):
+    """1D Residual Block with skip connection for stable training.
+    
+    Features skip connections and GELU activation for improved gradient flow
+    and preventing dead neurons.
+    
+    Args:
+        in_channels (int): Number of input channels
+        out_channels (int): Number of output channels
+        kernel_size (int): Kernel size for convolution (default: 5)
+        stride (int): Stride for convolution (default: 1)
+        padding (int): Padding for convolution (default: 2)
+    """
+    
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5,
+                 stride: int = 1, padding: int = 2):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels, out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding
+        )
+        self.bn = nn.BatchNorm1d(out_channels)
+        self.gelu = nn.GELU()
+        
+        # Projection for skip connection if channels or stride change
+        self.proj = None
+        if stride != 1 or in_channels != out_channels:
+            self.proj = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(out_channels)
+            )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        
+        out = self.conv(x)
+        out = self.bn(out)
+        out = self.gelu(out)
+        
+        # Apply projection if needed for skip connection
+        if self.proj is not None:
+            identity = self.proj(x)
+        
+        # Add skip connection
+        out = out + identity
+        return out
+
+
+class CnnRnnEncoder(nn.Module):
+    """
+    CNN + BiLSTM encoder for EMG feature extraction.
+    Architecture: Linear Projection -> ResNet-style Conv1D -> BiLSTM
+    
+    Input: (T, N, num_features) - flattened EMG features (matching TDSConvEncoder format)
+    Output: (T, N, hidden_size * 2) - encoded features
+    
+    Key improvements:
+    - Linear projection bottleneck compresses high-dimensional input (e.g., 700 dims)
+      to a stable latent space (256 dims) before convolutions
+    - Residual blocks with skip connections ensure stable gradient flow
+    - GELU activation instead of ReLU to prevent dead neurons
+    - 8x temporal reduction via 3 stride-2 layers (balanced for CTC alignment)
+    """
+    
+    def __init__(self, num_features: int, hidden_size: int = 128,
+                 num_layers: int = 2, latent_dim: int = 256):
+        super(CnnRnnEncoder, self).__init__()
+        
+        # Linear projection bottleneck: compress high-dimensional input to latent space
+        # This prevents feature explosion for large num_features (e.g., 700 -> 256)
+        self.projection = nn.Linear(num_features, latent_dim)
+        
+        # CNN Block with Residual Connections: 3 layers with stride 2 = 8x temporal reduction
+        # Channel progression: 256 -> 512 -> 1024
+        self.enc = nn.Sequential(
+            # Layer 1: stride 2
+            ResBlock1d(latent_dim, 512, kernel_size=7, stride=2, padding=3),
+            nn.Dropout(0.2),
+            
+            # Layer 2: stride 2
+            ResBlock1d(512, 1024, kernel_size=5, stride=2, padding=2),
+            nn.Dropout(0.2),
+            
+            # Layer 3: stride 2 (8x total reduction)
+            ResBlock1d(1024, 1024, kernel_size=5, stride=2, padding=2),
+            nn.Dropout(0.3)
+        )
+        
+        # Bi-directional LSTM for context modeling
+        self.lstm = nn.LSTM(
+            input_size=1024,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.3 if num_layers > 1 else 0
+        )
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            inputs: (T, N, num_features) - TNC format
+        
+        Returns:
+            features: (T, N, hidden_size * 2) - TNC format
+        """
+        T, N, C = inputs.shape
+        
+        # Apply linear projection: (T, N, num_features) -> (T, N, latent_dim)
+        x = self.projection(inputs)
+        
+        # Reformat for Conv1d: (T, N, latent_dim) -> (N, latent_dim, T)
+        x = x.permute(1, 2, 0)
+        
+        # CNN feature extraction with residual blocks: (N, latent_dim, T) -> (N, 1024, T_reduced)
+        x = self.enc(x)
+        
+        # Prepare for LSTM: (N, 1024, T_reduced) -> (N, T_reduced, 1024)
+        x = x.permute(0, 2, 1)
+        
+        # BiLSTM: (N, T_reduced, 1024) -> (N, T_reduced, hidden_size*2)
+        lstm_out, _ = self.lstm(x)
+        
+        # Convert back to TNC format: (N, T_reduced, hidden_size*2) -> (T_reduced, N, hidden_size*2)
+        features = lstm_out.permute(1, 0, 2)
+        
+        return features
+

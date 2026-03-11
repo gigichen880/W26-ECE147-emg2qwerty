@@ -24,6 +24,12 @@ specaug:
   time_mask_param: 15  # Max 200ms per time mask for 125Hz spectrogram
   n_freq_masks: 2
   freq_mask_param: 4
+  
+  # Old version params
+  # n_time_masks: 3
+  # time_mask_param: 25  # Max 200ms per time mask for 125Hz spectrogram
+  # n_freq_masks: 2
+  # freq_mask_param: 4
 
 raw_noise:
   _target_: emg2qwerty.transforms.AdditiveGaussianNoise
@@ -37,6 +43,8 @@ raw_timemask:
   n_masks: 2
   p: 0.5
   mask_value: 0.0
+
+
 
 logspec_norm:
   _target_: emg2qwerty.transforms.ZScoreNormalize
