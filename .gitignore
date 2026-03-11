@@ -58,3 +58,6 @@ wikitext-103-raw*
 .python-version
 pyproject.toml
 uv.lock
+
+# data
+*.hdf5
