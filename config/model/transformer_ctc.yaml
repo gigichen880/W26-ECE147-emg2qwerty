@@ -1,0 +1,18 @@
+# @package _global_
+module:
+  _target_: emg2qwerty.lightning.TransformerCTCModule
+  in_features: 528
+  mlp_features: [384]
+
+  nhead: 4
+  num_layers: 3
+  dim_feedforward: 768
+  dropout: 0.1
+  
+  norm_first: True
+  use_positional_encoding: True
+
+datamodule:
+  _target_: emg2qwerty.lightning.WindowedEMGDataModule
+  window_length: 8000
+  padding: [1800, 200]
