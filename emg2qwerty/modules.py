@@ -10,6 +10,17 @@ import torch
 from torch import nn
 
 
+def _conv1d_output_lengths(
+    lengths: torch.Tensor,
+    kernel_size: int,
+    stride: int = 1,
+    padding: int = 0,
+    dilation: int = 1,
+) -> torch.Tensor:
+    """Return the valid output lengths after a 1D convolution."""
+    return ((lengths + (2 * padding) - (dilation * (kernel_size - 1)) - 1) // stride) + 1
+
+
 class SpectrogramNorm(nn.Module):
     """A `torch.nn.Module` that applies 2D batch normalization over spectrogram
     per electrode channel per band. Inputs must be of shape
@@ -297,6 +308,9 @@ class ResBlock1d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5,
                  stride: int = 1, padding: int = 2):
         super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
         self.conv = nn.Conv1d(
             in_channels, out_channels,
             kernel_size=kernel_size,
@@ -329,6 +343,79 @@ class ResBlock1d(nn.Module):
         out = out + identity
         return out
 
+    def output_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        return _conv1d_output_lengths(
+            lengths=lengths,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+        )
+
+
+class CnnEncoder(nn.Module):
+    """
+    Pure temporal Conv1d encoder for CTC-based sequence modeling.
+
+    Input: (T, N, num_features)
+    Output: (T_out, N, conv_channels[-1])
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        latent_dim: int = 256,
+        conv_channels: Sequence[int] = (512, 1024, 1024),
+        kernel_sizes: Sequence[int] = (7, 5, 5),
+        strides: Sequence[int] = (2, 2, 2),
+        dropout_probs: Sequence[float] = (0.2, 0.2, 0.3),
+    ) -> None:
+        super().__init__()
+
+        assert len(conv_channels) > 0
+        assert len(conv_channels) == len(kernel_sizes) == len(strides) == len(
+            dropout_probs
+        )
+
+        self.projection = nn.Linear(num_features, latent_dim)
+
+        blocks: list[nn.Module] = []
+        residual_blocks: list[ResBlock1d] = []
+        in_channels = latent_dim
+        for out_channels, kernel_size, stride, dropout in zip(
+            conv_channels, kernel_sizes, strides, dropout_probs
+        ):
+            block = ResBlock1d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=kernel_size // 2,
+            )
+            residual_blocks.append(block)
+            blocks.extend([block, nn.Dropout(dropout)])
+            in_channels = out_channels
+
+        self.residual_blocks = nn.ModuleList(residual_blocks)
+        self.enc = nn.Sequential(*blocks)
+        self.output_dim = conv_channels[-1]
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # (T, N, C) -> (T, N, latent_dim)
+        x = self.projection(inputs)
+
+        # (T, N, latent_dim) -> (N, latent_dim, T)
+        x = x.permute(1, 2, 0)
+        x = self.enc(x)
+
+        # (N, C_out, T_out) -> (T_out, N, C_out)
+        return x.permute(2, 0, 1)
+
+    def output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
+        lengths = input_lengths.to(dtype=torch.long)
+        for block in self.residual_blocks:
+            lengths = block.output_lengths(lengths)
+        return lengths.to(dtype=input_lengths.dtype)
+
 
 class CnnRnnEncoder(nn.Module):
     """
@@ -349,30 +436,15 @@ class CnnRnnEncoder(nn.Module):
     def __init__(self, num_features: int, hidden_size: int = 128,
                  num_layers: int = 2, latent_dim: int = 256):
         super(CnnRnnEncoder, self).__init__()
-        
-        # Linear projection bottleneck: compress high-dimensional input to latent space
-        # This prevents feature explosion for large num_features (e.g., 700 -> 256)
-        self.projection = nn.Linear(num_features, latent_dim)
-        
-        # CNN Block with Residual Connections: 3 layers with stride 2 = 8x temporal reduction
-        # Channel progression: 256 -> 512 -> 1024
-        self.enc = nn.Sequential(
-            # Layer 1: stride 2
-            ResBlock1d(latent_dim, 512, kernel_size=7, stride=2, padding=3),
-            nn.Dropout(0.2),
-            
-            # Layer 2: stride 2
-            ResBlock1d(512, 1024, kernel_size=5, stride=2, padding=2),
-            nn.Dropout(0.2),
-            
-            # Layer 3: stride 2 (8x total reduction)
-            ResBlock1d(1024, 1024, kernel_size=5, stride=2, padding=2),
-            nn.Dropout(0.3)
+
+        self.cnn = CnnEncoder(
+            num_features=num_features,
+            latent_dim=latent_dim,
         )
-        
+
         # Bi-directional LSTM for context modeling
         self.lstm = nn.LSTM(
-            input_size=1024,
+            input_size=self.cnn.output_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
@@ -388,25 +460,18 @@ class CnnRnnEncoder(nn.Module):
         Returns:
             features: (T, N, hidden_size * 2) - TNC format
         """
-        T, N, C = inputs.shape
-        
-        # Apply linear projection: (T, N, num_features) -> (T, N, latent_dim)
-        x = self.projection(inputs)
-        
-        # Reformat for Conv1d: (T, N, latent_dim) -> (N, latent_dim, T)
-        x = x.permute(1, 2, 0)
-        
-        # CNN feature extraction with residual blocks: (N, latent_dim, T) -> (N, 1024, T_reduced)
-        x = self.enc(x)
-        
-        # Prepare for LSTM: (N, 1024, T_reduced) -> (N, T_reduced, 1024)
-        x = x.permute(0, 2, 1)
-        
+        x = self.cnn(inputs)
+
+        # (T_reduced, N, C) -> (N, T_reduced, C)
+        x = x.permute(1, 0, 2)
+
         # BiLSTM: (N, T_reduced, 1024) -> (N, T_reduced, hidden_size*2)
         lstm_out, _ = self.lstm(x)
-        
+
         # Convert back to TNC format: (N, T_reduced, hidden_size*2) -> (T_reduced, N, hidden_size*2)
         features = lstm_out.permute(1, 0, 2)
-        
+
         return features
 
+    def output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
+        return self.cnn.output_lengths(input_lengths)
