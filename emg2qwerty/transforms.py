@@ -121,6 +121,103 @@ class RandomBandRotation:
 
 
 @dataclass
+class RandomChannelSubset:
+    """Randomly keeps ``k`` channels and zeros the remaining channels.
+
+    This preserves the original tensor shape while applying channel-level
+    dropout-like augmentation over the electrode dimension.
+
+    Args:
+        k (int): Number of channels to keep.
+        channel_dim (int): The electrode channel dimension. (default: -1)
+    """
+
+    k: int
+    channel_dim: int = -1
+
+    def __post_init__(self) -> None:
+        assert self.k >= 0
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        channel_dim = self.channel_dim % tensor.ndim
+        num_channels = tensor.shape[channel_dim]
+
+        if self.k >= num_channels:
+            return tensor
+        if self.k == 0:
+            return torch.zeros_like(tensor)
+
+        selected = np.random.choice(num_channels, size=self.k, replace=False)
+        channel_mask = torch.zeros(num_channels, dtype=torch.bool, device=tensor.device)
+        channel_mask[selected] = True
+
+        # Broadcast channel mask over non-channel dimensions.
+        mask_shape = [1] * tensor.ndim
+        mask_shape[channel_dim] = num_channels
+        channel_mask = channel_mask.view(mask_shape)
+
+        return tensor * channel_mask.to(dtype=tensor.dtype)
+
+
+@dataclass
+class FixedChannelSubset:
+    """Keeps a fixed subset of channels and zeros the remaining channels.
+
+    This preserves the original tensor shape while masking specific channels.
+    Useful for reproducible evaluation with reduced channels.
+
+    Args:
+        k (int): Number of channels to keep. Required if indices not provided.
+        indices (list, optional): Explicit list of channel indices to keep.
+            If None, randomly selects k channels using seed.
+        seed (int): Random seed for selecting channels when indices not provided.
+            (default: 42)
+        channel_dim (int): The electrode channel dimension. (default: -1)
+    """
+
+    k: int = None
+    indices: Sequence[int] = None
+    seed: int = 42
+    channel_dim: int = -1
+
+    def __post_init__(self) -> None:
+        if self.indices is None:
+            assert self.k is not None and self.k >= 0
+            # Generate fixed indices on first init
+            rng = np.random.RandomState(self.seed)
+            # Note: actual num_channels determined at runtime in __call__
+            self._rng = rng
+        else:
+            self.indices = list(self.indices)
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        channel_dim = self.channel_dim % tensor.ndim
+        num_channels = tensor.shape[channel_dim]
+
+        # Determine which indices to keep
+        if self.indices is not None:
+            selected = self.indices
+        else:
+            if self.k >= num_channels:
+                return tensor
+            if self.k == 0:
+                return torch.zeros_like(tensor)
+            # Use fixed random state for reproducibility
+            selected = self._rng.choice(num_channels, size=self.k, replace=False)
+
+        # Create channel mask
+        channel_mask = torch.zeros(num_channels, dtype=torch.bool, device=tensor.device)
+        channel_mask[selected] = True
+
+        # Broadcast channel mask over non-channel dimensions
+        mask_shape = [1] * tensor.ndim
+        mask_shape[channel_dim] = num_channels
+        channel_mask = channel_mask.view(mask_shape)
+
+        return tensor * channel_mask.to(dtype=tensor.dtype)
+
+
+@dataclass
 class TemporalAlignmentJitter:
     """Applies a temporal jittering augmentation that randomly jitters the
     alignment of left and right EMG data by up to ``max_offset`` timesteps.
@@ -323,3 +420,4 @@ class TimeMaskRaw:
             t0 = np.random.randint(0, T - w)
             out[t0:t0 + w, ...] = self.mask_value
         return out
+

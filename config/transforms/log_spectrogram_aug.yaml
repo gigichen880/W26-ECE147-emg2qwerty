@@ -25,19 +25,6 @@ specaug:
   n_freq_masks: 2
   freq_mask_param: 4
 
-raw_noise:
-  _target_: emg2qwerty.transforms.AdditiveGaussianNoise
-  sigma: 0.01
-  p: 0.3
-  relative: true
-
-raw_timemask:
-  _target_: emg2qwerty.transforms.TimeMaskRaw
-  max_width: 100   # 100ms @ 2kHz
-  n_masks: 1
-  p: 0.3
-  mask_value: 0.0
-
 logspec_norm:
   _target_: emg2qwerty.transforms.ZScoreNormalize
   eps: 1.0e-6
@@ -45,8 +32,6 @@ logspec_norm:
 transforms:
   train:
     - ${to_tensor}
-    - ${raw_noise}        # new: raw-domain noise
-    - ${raw_timemask}     # new: raw-domain time masking
     - ${band_rotation}
     - ${temporal_jitter}
     - ${logspec}
