@@ -9,6 +9,158 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
+import math
+
+class TemporalConvFrontend(nn.Module):
+    """
+    Temporal convolution block before transformer.
+    Captures local EMG dynamics before attention.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (T, N, D)
+        """
+        x = x.permute(1, 2, 0)  # (N, D, T)
+        x = self.conv(x)
+        x = x.permute(2, 0, 1)  # (T, N, D)
+        return x
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Standard sinusoidal positional encoding.
+    Adds position-dependent signal to a (T, N, D) sequence tensor.
+
+    Args:
+        d_model: feature dimension D
+        dropout: dropout applied after adding positional encoding
+    """
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.d_model = d_model
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (T, N, D)
+        """
+        T, N, D = x.shape
+        device = x.device
+
+        position = torch.arange(T, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, D, 2, device=device) * (-math.log(10000.0) / D)
+        )
+
+        pe = torch.zeros(T, D, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        x = x + pe.unsqueeze(1)
+
+        return self.dropout(x)
+
+def lengths_to_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    """
+    Build a src_key_padding_mask for nn.TransformerEncoder.
+
+    Args:
+        lengths: (N,) int tensor of valid lengths (<= max_len)
+        max_len: T
+    Returns:
+        mask: (N, T) bool tensor where True indicates PAD (to be ignored)
+    """
+    # shape: (N, T)
+    arange = torch.arange(max_len, device=lengths.device).unsqueeze(0)
+    return arange >= lengths.unsqueeze(1)
+
+
+class TransformerSequenceEncoder(nn.Module):
+    """
+    Transformer encoder over time for (T, N, D) sequences.
+
+    - No temporal downsampling: output time length equals input time length.
+    - Uses src_key_padding_mask so padded timesteps do not participate in attention.
+
+    Args:
+        d_model: input/output feature dim D
+        nhead: number of attention heads (must divide d_model)
+        num_layers: number of encoder layers
+        dim_feedforward: FFN hidden size (default: 4*d_model)
+        dropout: dropout in transformer layers
+        max_len: max sequence length for sinusoidal positions
+        norm_first: Pre-LN if True (recommended for stability)
+        use_positional_encoding: if True, adds sinusoidal position encoding
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int | None = None,
+        dropout: float = 0.1,
+        norm_first: bool = True,
+        use_positional_encoding: bool = True,
+    ) -> None:
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by nhead={nhead}")
+
+        self.use_positional_encoding = use_positional_encoding
+        self.pos_enc = (
+            SinusoidalPositionalEncoding(d_model=d_model, dropout=dropout)
+            if use_positional_encoding
+            else nn.Identity()
+        )
+
+        d_ff = dim_feedforward if dim_feedforward is not None else 4 * d_model
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,   # expects (T, N, D)
+            norm_first=norm_first,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+        # Optional final norm
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            x: (T, N, D)
+            lengths: (N,) valid lengths before padding. If None, no padding mask is used.
+        Returns:
+            y: (T, N, D)
+        """
+        T, N, D = x.shape
+
+        x = self.pos_enc(x)
+
+        src_key_padding_mask = None
+        if lengths is not None:
+            if lengths.shape != (N,):
+                raise ValueError(f"lengths must have shape (N,), got {tuple(lengths.shape)}")
+            lengths = lengths.to(device=x.device, dtype=torch.long)
+            src_key_padding_mask = lengths_to_padding_mask(lengths, max_len=T)  # (N, T)
+
+        y = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # (T, N, D)
+        return self.out_norm(y)
 
 def _conv1d_output_lengths(
     lengths: torch.Tensor,
@@ -289,6 +441,72 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+    
+
+class BiGRUEncoder(nn.Module):
+    """
+    Bidirectional GRU encoder for sequence modeling.
+
+    Inputs:
+        (T, N, num_features)
+
+    Outputs:
+        (T, N, hidden_size * 2)
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs, _ = self.gru(inputs)
+        return outputs
+
+
+class BiLSTMEncoder(nn.Module):
+    """
+    Bidirectional LSTM encoder for sequence modeling.
+
+    Inputs:
+        (T, N, num_features)
+
+    Outputs:
+        (T, N, hidden_size * 2)
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs, _ = self.lstm(inputs)
+        return outputs
 
 
 class ResBlock1d(nn.Module):

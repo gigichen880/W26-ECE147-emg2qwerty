@@ -53,6 +53,7 @@ bids_data
 
 # LM
 wikitext-103-raw*
+colab_setup.ipynb
 
 # UV
 .python-version
