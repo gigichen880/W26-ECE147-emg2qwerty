@@ -6,8 +6,8 @@ module:
   in_features: 528
   mlp_features: [384]
 
-  nhead: 8
-  num_layers: 6
+  nhead: 4
+  num_layers: 3
   dim_feedforward: 768
   dropout: 0.1
 
